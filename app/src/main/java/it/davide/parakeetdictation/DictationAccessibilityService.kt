@@ -36,7 +36,10 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
     private lateinit var windowManager: WindowManager
     private var bubble: View? = null
     private var micButton: FrameLayout? = null
-    private var waveEffect: RecordingWavesView? = null
+    private var recordingVisualizer: RecordingVisualizerView? = null
+    private var visualizerParams: WindowManager.LayoutParams? = null
+    private var cancelButton: View? = null
+    private var cancelParams: WindowManager.LayoutParams? = null
     private var windowParams: WindowManager.LayoutParams? = null
     private var keyboardVisible = false
     private var keyboardTop = 0
@@ -150,17 +153,14 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
             addView(MicGlyph(this@DictationAccessibilityService), FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER))
         }
         micButton = mic
-        val waves = RecordingWavesView(this)
         val overlay = FrameLayout(this).apply {
             isClickable = true
             isFocusable = false
             setBackgroundColor(Color.TRANSPARENT)
-            addView(waves, FrameLayout.LayoutParams(-1, -1))
             addView(mic, FrameLayout.LayoutParams(dp(BUBBLE_DIAMETER_DP), dp(BUBBLE_DIAMETER_DP), Gravity.CENTER))
             setOnClickListener { if (!suppressClickAction) onMicTapped() }
             setOnTouchListener(::handleBubbleTouch)
         }
-        waveEffect = waves
 
         val point = screenSize()
         val prefs = getSharedPreferences(BUBBLE_PREFERENCES, MODE_PRIVATE)
@@ -191,11 +191,9 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
             renderStatus(DictationEngine.currentStatus())
         } catch (_: SecurityException) {
             bubble = null
-            waveEffect = null
             openSetup()
         } catch (_: WindowManager.BadTokenException) {
             bubble = null
-            waveEffect = null
         }
     }
 
@@ -205,14 +203,14 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
         val point = screenSize()
         clampBubblePosition(params, point.x, point.y, view.width.takeIf { it > 0 } ?: dp(BUBBLE_DIAMETER_DP))
         runCatching { windowManager.updateViewLayout(view, params) }
+        updateRecordingOverlayPositions()
     }
 
     private fun hideBubble() {
-        waveEffect?.setRecording(false)
+        hideRecordingOverlays()
         bubble?.let { view -> runCatching { windowManager.removeView(view) } }
         bubble = null
         micButton = null
-        waveEffect = null
         windowParams = null
     }
 
@@ -293,6 +291,7 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
         params.x = x.coerceIn(0, maxOf(0, point.x - size))
         params.y = y.coerceIn(0, maxOf(0, point.y - size))
         runCatching { windowManager.updateViewLayout(view, params) }
+        updateRecordingOverlayPositions()
     }
 
     private fun saveBubblePosition() {
@@ -333,7 +332,7 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
         micButton?.let { button ->
             button.background = circle(LIME)
         }
-        waveEffect?.setRecording(isRecording)
+        updateRecordingOverlays(isRecording)
         val actionDescription = when {
             sensitiveEditor -> "Dettatura disattivata nel campo protetto"
             !editorAvailable -> "Campo di testo non disponibile. $phaseTitle"
@@ -447,11 +446,28 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
     private fun capture(recorder: AudioRecord, bufferSamples: Int) {
         val samples = FloatSamples(MAX_SAMPLES)
         val buffer = ShortArray(maxOf(bufferSamples, 1024))
+        var lastLevelUpdate = 0L
         try {
             recorder.startRecording()
             while (recording && samples.size < MAX_SAMPLES) {
                 val count = recorder.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
-                if (count > 0) samples.append(buffer, count)
+                if (count > 0) {
+                    samples.append(buffer, count)
+                    val now = SystemClock.uptimeMillis()
+                    if (now - lastLevelUpdate >= AUDIO_LEVEL_UPDATE_MS) {
+                        lastLevelUpdate = now
+                        var energy = 0.0
+                        for (index in 0 until count) {
+                            val sample = buffer[index] / 32768.0
+                            energy += sample * sample
+                        }
+                        val rms = kotlin.math.sqrt(energy / count).toFloat()
+                        val level = ((rms - AUDIO_LEVEL_NOISE_FLOOR) / AUDIO_LEVEL_FULL_SCALE).coerceIn(0f, 1f)
+                        mainHandler.post {
+                            if (recording) recordingVisualizer?.setAudioLevel(level)
+                        }
+                    }
+                }
                 if (count < 0 && recording) error("Lettura dal microfono interrotta ($count).")
             }
             if (samples.size >= MAX_SAMPLES) submitAfterRecording = true
@@ -491,8 +507,126 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
         if (!recording) return
         submitAfterRecording = submit
         recording = false
+        updateRecordingOverlays(false)
         try { audioRecord?.stop() } catch (_: IllegalStateException) { }
         if (submit) DictationEngine.onRecordingStopped() else DictationEngine.cancelRecordingStatus()
+    }
+
+    private fun updateRecordingOverlays(active: Boolean) {
+        if (!active || !keyboardVisible || bubble == null) {
+            hideRecordingOverlays()
+            return
+        }
+        showRecordingVisualizer()
+        showCancelButton()
+        updateRecordingOverlayPositions()
+    }
+
+    private fun showRecordingVisualizer() {
+        if (recordingVisualizer != null) return
+        val view = RecordingVisualizerView(this).apply { setRecording(true) }
+        val size = screenSize()
+        val params = WindowManager.LayoutParams(
+            size.x,
+            dp(VISUALIZER_HEIGHT_DP),
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT,
+        ).apply {
+            gravity = Gravity.TOP or Gravity.LEFT
+            x = 0
+            y = 0
+            title = "Parakeet Dictation audio level"
+        }
+        try {
+            windowManager.addView(view, params)
+            recordingVisualizer = view
+            visualizerParams = params
+        } catch (_: WindowManager.BadTokenException) {
+            recordingVisualizer = null
+            visualizerParams = null
+        } catch (_: SecurityException) {
+            recordingVisualizer = null
+            visualizerParams = null
+        }
+    }
+
+    private fun showCancelButton() {
+        if (cancelButton != null) return
+        val button = FrameLayout(this).apply {
+            background = circle(CANCEL_RED)
+            isClickable = true
+            isFocusable = false
+            contentDescription = "Annulla dettatura"
+            addView(CancelGlyph(this@DictationAccessibilityService), FrameLayout.LayoutParams(dp(17), dp(17), Gravity.CENTER))
+            setOnClickListener { if (recording) stopRecording(submit = false) }
+        }
+        val size = dp(CANCEL_BUTTON_DP)
+        val params = WindowManager.LayoutParams(
+            size,
+            size,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT,
+        ).apply {
+            gravity = Gravity.TOP or Gravity.LEFT
+            title = "Annulla dettatura"
+        }
+        try {
+            windowManager.addView(button, params)
+            cancelButton = button
+            cancelParams = params
+        } catch (_: WindowManager.BadTokenException) {
+            cancelButton = null
+            cancelParams = null
+        } catch (_: SecurityException) {
+            cancelButton = null
+            cancelParams = null
+        }
+    }
+
+    private fun updateRecordingOverlayPositions() {
+        val bubbleParams = windowParams ?: return
+        val point = screenSize()
+        val visualizer = recordingVisualizer
+        val visualParams = visualizerParams
+        if (visualizer != null && visualParams != null) {
+            val visualHeight = dp(VISUALIZER_HEIGHT_DP)
+            val visualY = bubbleParams.y + dp(OVERLAY_SIZE_DP) / 2 - visualHeight / 2
+            visualParams.width = point.x
+            visualParams.y = visualY.coerceIn(0, maxOf(0, point.y - visualHeight))
+            runCatching { windowManager.updateViewLayout(visualizer, visualParams) }
+            val centerY = bubbleParams.y + dp(OVERLAY_SIZE_DP) / 2 - visualParams.y
+            val centerX = bubbleParams.x + dp(OVERLAY_SIZE_DP) / 2
+            visualizer.setAnchor(centerX.toFloat(), centerY.toFloat(), point.x - centerX >= centerX)
+        }
+
+        val button = cancelButton
+        val buttonParams = cancelParams
+        if (button != null && buttonParams != null) {
+            val buttonSize = dp(CANCEL_BUTTON_DP)
+            val x = bubbleParams.x + dp(CANCEL_X_OFFSET_DP)
+            val y = bubbleParams.y + dp(CANCEL_Y_OFFSET_DP)
+            buttonParams.x = x.coerceIn(0, maxOf(0, point.x - buttonSize))
+            buttonParams.y = y.coerceIn(0, maxOf(0, point.y - buttonSize))
+            runCatching { windowManager.updateViewLayout(button, buttonParams) }
+        }
+    }
+
+    private fun hideRecordingOverlays() {
+        recordingVisualizer?.let { view ->
+            view.setRecording(false)
+            runCatching { windowManager.removeView(view) }
+        }
+        recordingVisualizer = null
+        visualizerParams = null
+        cancelButton?.let { view -> runCatching { windowManager.removeView(view) } }
+        cancelButton = null
+        cancelParams = null
     }
 
     private fun insertIntoFocusedField(text: String): Boolean {
@@ -616,18 +750,54 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
         }
     }
 
-    private class RecordingWavesView(context: android.content.Context) : View(context) {
+    private class RecordingVisualizerView(context: android.content.Context) : View(context) {
         private val density = resources.displayMetrics.density
-        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        private val wavePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = LIME
             style = Paint.Style.STROKE
-            strokeWidth = 2f * density
+            strokeWidth = 3.4f * density
+            strokeCap = Paint.Cap.ROUND
+        }
+        private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = LIME
+            style = Paint.Style.STROKE
+            strokeWidth = 8f * density
+            strokeCap = Paint.Cap.ROUND
+        }
+        private val barPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = LIME
+            style = Paint.Style.FILL
+        }
+        private val barGlowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = LIME
+            style = Paint.Style.FILL
         }
         private var recording = false
+        private var anchorX = 0f
+        private var anchorY = 0f
+        private var meterToRight = true
+        private var targetLevel = 0f
+        private var displayedLevel = 0f
 
         fun setRecording(active: Boolean) {
             if (recording == active) return
             recording = active
+            if (!active) {
+                targetLevel = 0f
+                displayedLevel = 0f
+            }
+            invalidate()
+        }
+
+        fun setAudioLevel(level: Float) {
+            targetLevel = level.coerceIn(0f, 1f)
+            invalidate()
+        }
+
+        fun setAnchor(x: Float, y: Float, barOnRight: Boolean) {
+            anchorX = x
+            anchorY = y
+            meterToRight = barOnRight
             invalidate()
         }
 
@@ -636,15 +806,36 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
             if (!recording) return
 
             val cycle = (SystemClock.uptimeMillis() % WAVE_CYCLE_MS).toFloat() / WAVE_CYCLE_MS
-            val centerX = width / 2f
-            val centerY = height / 2f
+            val outerRadius = minOf(dp(WAVE_OUTER_RADIUS_DP).toFloat(), height / 2f - dp(WAVE_EDGE_MARGIN_DP))
             val innerRadius = dp(WAVE_INNER_RADIUS_DP).toFloat()
-            val outerRadius = minOf(width, height) / 2f - dp(WAVE_EDGE_MARGIN_DP)
             for (index in 0 until WAVE_COUNT) {
                 val phase = (cycle + index.toFloat() / WAVE_COUNT) % 1f
                 val radius = innerRadius + (outerRadius - innerRadius) * phase
-                paint.alpha = ((1f - phase) * 210).toInt()
-                canvas.drawCircle(centerX, centerY, radius, paint)
+                val alpha = ((1f - phase) * 180f + 70f).toInt().coerceIn(60, 250)
+                glowPaint.alpha = (alpha * 0.24f).toInt()
+                wavePaint.alpha = alpha
+                canvas.drawCircle(anchorX, anchorY, radius, glowPaint)
+                canvas.drawCircle(anchorX, anchorY, radius, wavePaint)
+            }
+
+            displayedLevel += (targetLevel - displayedLevel) * if (targetLevel > displayedLevel) 0.42f else 0.18f
+            val direction = if (meterToRight) 1f else -1f
+            val meterCenter = anchorX + direction * dp(WAVE_OUTER_RADIUS_DP + METER_GAP_DP)
+            val barWidth = dp(METER_BAR_WIDTH_DP).toFloat()
+            val spacing = dp(METER_BAR_SPACING_DP).toFloat()
+            val weights = floatArrayOf(0.42f, 0.66f, 0.84f, 1f, 0.9f, 0.72f, 0.52f, 0.76f, 0.46f)
+            val time = SystemClock.uptimeMillis() / 1000f
+            for (index in weights.indices) {
+                val voiceShape = 0.72f + 0.28f * kotlin.math.abs(kotlin.math.sin(time * (3.4f + index * 0.17f) + index))
+                val amplitude = displayedLevel * weights[index] * voiceShape
+                val barHeight = dp(METER_MIN_HEIGHT_DP) + dp(METER_MAX_HEIGHT_DP) * amplitude
+                val x = meterCenter + direction * (index - (weights.size - 1) / 2f) * spacing
+                val top = anchorY - barHeight / 2f
+                val rect = android.graphics.RectF(x - barWidth / 2f, top, x + barWidth / 2f, top + barHeight)
+                barGlowPaint.alpha = (55 + amplitude * 80f).toInt().coerceIn(55, 135)
+                barPaint.alpha = (185 + amplitude * 70f).toInt().coerceIn(185, 255)
+                canvas.drawRoundRect(rect, barWidth, barWidth, barGlowPaint)
+                canvas.drawRoundRect(rect, barWidth, barWidth, barPaint)
             }
             postInvalidateOnAnimation()
         }
@@ -652,21 +843,51 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
         private fun dp(value: Int): Int = (value * density).toInt()
     }
 
+    private class CancelGlyph(context: android.content.Context) : View(context) {
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.STROKE
+            strokeWidth = 2.7f * resources.displayMetrics.density
+            strokeCap = Paint.Cap.ROUND
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val inset = 3.5f * resources.displayMetrics.density
+            canvas.drawLine(inset, inset, width - inset, height - inset, paint)
+            canvas.drawLine(width - inset, inset, inset, height - inset, paint)
+        }
+    }
+
     companion object {
         private const val BUBBLE_DIAMETER_DP = 54
         private const val OVERLAY_SIZE_DP = 84
+        private const val VISUALIZER_HEIGHT_DP = 156
+        private const val CANCEL_BUTTON_DP = 38
+        private const val CANCEL_X_OFFSET_DP = 54
+        private const val CANCEL_Y_OFFSET_DP = -5
         private const val BUBBLE_PREFERENCES = "parakeet_bubble_position"
         private const val BUBBLE_X_FRACTION = "x_fraction"
         private const val BUBBLE_Y_FRACTION = "y_fraction"
         private const val TAP_TO_TOGGLE_MS = 200L
-        private const val WAVE_CYCLE_MS = 1_200L
-        private const val WAVE_COUNT = 3
-        private const val WAVE_INNER_RADIUS_DP = 29
-        private const val WAVE_EDGE_MARGIN_DP = 3
+        private const val WAVE_CYCLE_MS = 1_300L
+        private const val WAVE_COUNT = 4
+        private const val WAVE_INNER_RADIUS_DP = 34
+        private const val WAVE_OUTER_RADIUS_DP = 70
+        private const val WAVE_EDGE_MARGIN_DP = 5
+        private const val METER_GAP_DP = 34
+        private const val METER_BAR_WIDTH_DP = 4
+        private const val METER_BAR_SPACING_DP = 7
+        private const val METER_MIN_HEIGHT_DP = 5
+        private const val METER_MAX_HEIGHT_DP = 48
+        private const val AUDIO_LEVEL_UPDATE_MS = 45L
+        private const val AUDIO_LEVEL_NOISE_FLOOR = 0.006f
+        private const val AUDIO_LEVEL_FULL_SCALE = 0.075f
         private const val MAX_RECORD_SECONDS = 120
         private const val MAX_SAMPLES = ModelFiles.SAMPLE_RATE * MAX_RECORD_SECONDS
         private const val MAX_EDITABLE_TEXT = 100_000
         private const val LIME = 0xffb8f36b.toInt()
+        private const val CANCEL_RED = 0xffe5484d.toInt()
     }
 
     private enum class PressStartResult { STARTED, NEEDS_SETUP, REJECTED }
