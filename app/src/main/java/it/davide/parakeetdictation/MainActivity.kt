@@ -17,6 +17,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
 
 class MainActivity : Activity() {
@@ -26,7 +27,10 @@ class MainActivity : Activity() {
     private lateinit var permissionButton: Button
     private lateinit var serviceButton: Button
     private lateinit var serviceStatus: TextView
+    private lateinit var keepCpuSwitch: Switch
+    private lateinit var keepCpuDescription: TextView
     private var downloadActive = false
+    private var updatingCpuSwitch = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -34,11 +38,13 @@ class MainActivity : Activity() {
         window.navigationBarColor = Color.rgb(16, 19, 26)
         window.decorView.systemUiVisibility = 0
         setContentView(buildScreen())
+        DictationEngine.initialize(this)
         refreshState()
     }
 
     override fun onResume() {
         super.onResume()
+        DictationEngine.initialize(this)
         refreshState()
     }
 
@@ -109,6 +115,45 @@ class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(-1, dp(54)).apply { topMargin = dp(18) }
         }
         modelCard.addView(downloadButton)
+        val cpuOption = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(18), 0, 0)
+        }
+        val cpuOptionText = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+        }
+        cpuOptionText.addView(label("Mantieni il modello in RAM · CPU", 14f, WHITE, true))
+        keepCpuDescription = label("Disattivo: viene scaricato un minuto dopo la chiusura della tastiera.", 12f, MUTED).apply {
+            setPadding(0, dp(4), dp(8), 0)
+        }
+        cpuOptionText.addView(keepCpuDescription)
+        cpuOption.addView(cpuOptionText)
+        keepCpuSwitch = Switch(this).apply {
+            isChecked = DictationEngine.isKeepModelWarmOnCpu(this@MainActivity)
+            thumbTintList = android.content.res.ColorStateList(
+                arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+                intArrayOf(LIME, Color.rgb(210, 214, 222)),
+            )
+            trackTintList = android.content.res.ColorStateList(
+                arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+                intArrayOf(LIME.withAlpha(100), Color.rgb(77, 83, 96)),
+            )
+            setOnCheckedChangeListener { _, checked ->
+                if (updatingCpuSwitch) return@setOnCheckedChangeListener
+                if (checked && !ModelFiles.isInstalled(this@MainActivity)) {
+                    updatingCpuSwitch = true
+                    isChecked = false
+                    updatingCpuSwitch = false
+                    return@setOnCheckedChangeListener
+                }
+                updateCpuOptionDescription(checked)
+                DictationEngine.setKeepModelWarmOnCpu(this@MainActivity, checked)
+            }
+        }
+        cpuOption.addView(keepCpuSwitch)
+        modelCard.addView(cpuOption)
         page.addView(modelCard)
 
         val setupCard = card().apply {
@@ -140,7 +185,7 @@ class MainActivity : Activity() {
         howCard.addView(step("01", "Concedi microfono e attiva il servizio di accessibilità."))
         howCard.addView(step("02", "Apri un campo di testo: la bolla appare e il modello si carica subito."))
         howCard.addView(step("03", "Tocca la bolla, parla e toccala di nuovo: il testo entra nel campo attivo."))
-        howCard.addView(step("04", "Quando chiudi la tastiera, la bolla sparisce. Il modello viene scaricato dalla RAM dopo 1 minuto."))
+        howCard.addView(step("04", "La bolla verde è trascinabile. Quando chiudi la tastiera sparisce; il modello viene scaricato dopo 1 minuto, a meno che tu attivi la modalità CPU sempre in RAM."))
         page.addView(howCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) })
 
         val noteCard = card().apply { setBackground(rounded(Color.rgb(28, 32, 42), dp(20))) }
@@ -193,6 +238,7 @@ class MainActivity : Activity() {
                 runOnUiThread {
                     downloadActive = false
                     downloadProgress.visibility = View.GONE
+                    DictationEngine.initialize(this@MainActivity)
                     refreshState()
                 }
             }
@@ -231,6 +277,11 @@ class MainActivity : Activity() {
     private fun refreshState() {
         if (!::modelLabel.isInitialized) return
         val modelReady = ModelFiles.isInstalled(this)
+        updatingCpuSwitch = true
+        keepCpuSwitch.isChecked = DictationEngine.isKeepModelWarmOnCpu(this)
+        keepCpuSwitch.isEnabled = modelReady
+        updateCpuOptionDescription(keepCpuSwitch.isChecked)
+        updatingCpuSwitch = false
         if (!downloadActive && !ModelDownloader.isDownloading()) {
             modelLabel.text = if (modelReady) "Modello installato e verificato · 671 MB" else "Modello non ancora scaricato · 671 MB"
             downloadButton.text = if (modelReady) "Modello verificato" else "Scarica il modello · 671 MB"
@@ -302,6 +353,14 @@ class MainActivity : Activity() {
 
     private fun formatMb(bytes: Long): String = "%.0f MB".format(bytes / 1_000_000.0)
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private fun updateCpuOptionDescription(enabled: Boolean) {
+        keepCpuDescription.text = if (enabled) {
+            "Attivo: il modello resta nella RAM sulla CPU anche quando la tastiera è chiusa. Aumenta l'uso di memoria e batteria."
+        } else {
+            "Disattivo: viene scaricato un minuto dopo la chiusura della tastiera."
+        }
+    }
 
     private fun Int.withAlpha(alpha: Int): Int = (this and 0x00ffffff) or (alpha shl 24)
 

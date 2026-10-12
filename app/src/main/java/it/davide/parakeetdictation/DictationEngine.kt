@@ -28,6 +28,8 @@ object DictationEngine {
     }
 
     private const val RELEASE_DELAY_MS = 60_000L
+    private const val PREFERENCES = "parakeet_dictation_settings"
+    private const val KEEP_CPU_WARM_KEY = "keep_model_warm_on_cpu"
     private val mainHandler = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "parakeet-inference").apply { priority = Thread.NORM_PRIORITY - 1 }
@@ -39,11 +41,12 @@ object DictationEngine {
     @Volatile private var recognizer: OfflineRecognizer? = null
     @Volatile private var activeProvider = "cpu"
     @Volatile private var modelDirectory: String? = null
+    @Volatile private var keepModelWarmOnCpu = false
     @Volatile private var status = Status(Phase.MISSING_MODEL, "Scarica il modello nell'app")
 
     private val releaseRecognizer = Runnable {
         worker.execute {
-            if (!keyboardVisible) {
+            if (!keyboardVisible && !keepModelWarmOnCpu) {
                 recognizer?.release()
                 recognizer = null
                 activeProvider = "cpu"
@@ -68,32 +71,92 @@ object DictationEngine {
     fun currentPhase(): Phase = status.phase
     fun currentStatus(): Status = status
 
+    fun isKeepModelWarmOnCpu(context: Context): Boolean = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+        .getBoolean(KEEP_CPU_WARM_KEY, false)
+
+    /** Restore the resident-CPU preference after the app or accessibility service process starts. */
+    fun initialize(context: Context) {
+        val appContext = context.applicationContext
+        keepModelWarmOnCpu = isKeepModelWarmOnCpu(appContext)
+        modelDirectory = ModelFiles.directory(appContext).absolutePath
+        if (!keepModelWarmOnCpu) return
+        mainHandler.removeCallbacks(releaseRecognizer)
+        if (!ModelFiles.isInstalled(appContext)) {
+            publish(Status(Phase.MISSING_MODEL, "Scarica prima il modello nell'app"))
+            return
+        }
+        if (recognizer != null && activeProvider == "cpu") {
+            publish(readyStatus())
+        } else {
+            publish(Status(Phase.LOADING, "Carico Parakeet sulla CPU…"))
+            enqueueLoad(appContext)
+        }
+    }
+
+    /** When enabled, load on CPU immediately and keep the recognizer resident after the keyboard closes. */
+    fun setKeepModelWarmOnCpu(context: Context, enabled: Boolean) {
+        val appContext = context.applicationContext
+        appContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE).edit()
+            .putBoolean(KEEP_CPU_WARM_KEY, enabled)
+            .apply()
+        keepModelWarmOnCpu = enabled
+        modelDirectory = ModelFiles.directory(appContext).absolutePath
+        mainHandler.removeCallbacks(releaseRecognizer)
+
+        if (enabled) {
+            if (!ModelFiles.isInstalled(appContext)) {
+                publish(Status(Phase.MISSING_MODEL, "Scarica prima il modello nell'app"))
+                return
+            }
+            if (recognizer != null && activeProvider == "cpu") {
+                publish(readyStatus())
+            } else {
+                publish(Status(Phase.LOADING, "Carico Parakeet sulla CPU…"))
+                enqueueLoad(appContext)
+            }
+        } else if (keyboardVisible) {
+            if (recognizer != null) publish(readyStatus())
+        } else {
+            publish(if (ModelFiles.isInstalledPath(modelDirectory)) {
+                Status(Phase.IDLE, "Modello in RAM per 1 minuto")
+            } else {
+                Status(Phase.MISSING_MODEL, "Scarica prima il modello nell'app")
+            })
+            mainHandler.postDelayed(releaseRecognizer, RELEASE_DELAY_MS)
+        }
+    }
+
     fun onKeyboardShown(context: Context) {
         mainHandler.removeCallbacks(releaseRecognizer)
         keyboardVisible = true
+        keepModelWarmOnCpu = isKeepModelWarmOnCpu(context)
         modelDirectory = ModelFiles.directory(context).absolutePath
         if (!ModelFiles.isInstalled(context)) {
             publish(Status(Phase.MISSING_MODEL, "Scarica prima il modello nell'app"))
             return
         }
-        if (recognizer != null) {
+        if (recognizer != null && (!keepModelWarmOnCpu || activeProvider == "cpu")) {
             publish(readyStatus())
             return
         }
-        publish(Status(Phase.LOADING, "Carico Parakeet in memoria…"))
+        publish(Status(Phase.LOADING, if (keepModelWarmOnCpu) "Carico Parakeet sulla CPU…" else "Carico Parakeet in memoria…"))
         enqueueLoad(context.applicationContext)
     }
 
     /** Hide the bubble immediately; retain the recognizer for one minute to absorb IME flaps. */
     fun onKeyboardHidden() {
         keyboardVisible = false
-        publish(if (ModelFiles.isInstalledPath(modelDirectory)) {
-            Status(Phase.IDLE, "Modello in memoria per 1 minuto")
-        } else {
-            Status(Phase.MISSING_MODEL, "Scarica prima il modello nell'app")
-        })
         mainHandler.removeCallbacks(releaseRecognizer)
-        mainHandler.postDelayed(releaseRecognizer, RELEASE_DELAY_MS)
+        if (keepModelWarmOnCpu) {
+            if (recognizer != null) publish(readyStatus())
+        } else {
+            publish(if (ModelFiles.isInstalledPath(modelDirectory)) {
+                Status(Phase.IDLE, "Modello in RAM per 1 minuto")
+            } else {
+                Status(Phase.MISSING_MODEL, "Scarica prima il modello nell'app")
+            })
+            mainHandler.postDelayed(releaseRecognizer, RELEASE_DELAY_MS)
+        }
     }
 
     fun onRecordingStarted() {
@@ -142,20 +205,41 @@ object DictationEngine {
     private fun enqueueLoad(appContext: Context) {
         if (!loadQueued.compareAndSet(false, true)) return
         worker.execute {
+            val preferredProvider = if (keepModelWarmOnCpu) "cpu" else "nnapi"
             try {
-                if (!keyboardVisible) return@execute
+                if (!keyboardVisible && !keepModelWarmOnCpu) return@execute
+                if (recognizer != null && preferredProvider == "cpu" && activeProvider != "cpu") {
+                    recognizer?.release()
+                    recognizer = null
+                }
+                if (recognizer != null) {
+                    publish(readyStatus())
+                    return@execute
+                }
                 val memory = ActivityManager.MemoryInfo()
                 (appContext.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(memory)
                 if (memory.lowMemory) {
                     publish(Status(Phase.ERROR, "Il telefono segnala poca memoria libera."))
                     return@execute
                 }
-                tryLoad(appContext, "nnapi")
+                if (preferredProvider == "cpu") {
+                    tryLoad(appContext, "cpu")
+                } else {
+                    tryLoad(appContext, "nnapi")
+                }
             } catch (acceleratorError: Throwable) {
-                if (!keyboardVisible) return@execute
+                if (preferredProvider == "cpu") {
+                    if (keyboardVisible || keepModelWarmOnCpu) {
+                        val details = acceleratorError.message?.takeIf { it.isNotBlank() }
+                            ?: "Errore nel caricamento del modello sulla CPU."
+                        publish(Status(Phase.ERROR, "Caricamento non riuscito: $details"))
+                    }
+                    return@execute
+                }
+                if (!keyboardVisible && !keepModelWarmOnCpu) return@execute
                 try {
                     val loaded = createRecognizer("cpu")
-                    if (keyboardVisible) {
+                    if (keyboardVisible || keepModelWarmOnCpu) {
                         recognizer = loaded
                         activeProvider = "cpu"
                         publish(Status(Phase.READY, "Pronto · CPU", acceleratorRequested = false))
@@ -170,7 +254,11 @@ object DictationEngine {
                 }
             } finally {
                 loadQueued.set(false)
-                if (keyboardVisible && recognizer == null && status.phase == Phase.LOADING && ModelFiles.isInstalledPath(modelDirectory)) {
+                val shouldRemainLoaded = keyboardVisible || keepModelWarmOnCpu
+                val providerNeedsSwitch = keepModelWarmOnCpu && recognizer != null && activeProvider != "cpu"
+                val loadWasInterrupted = shouldRemainLoaded && recognizer == null && status.phase == Phase.LOADING
+                if (shouldRemainLoaded && ModelFiles.isInstalledPath(modelDirectory) && (providerNeedsSwitch || loadWasInterrupted)) {
+                    if (providerNeedsSwitch) publish(Status(Phase.LOADING, "Carico Parakeet sulla CPU…"))
                     enqueueLoad(appContext)
                 }
             }
@@ -179,7 +267,7 @@ object DictationEngine {
 
     private fun tryLoad(context: Context, provider: String) {
         val loaded = createRecognizer(provider)
-        if (keyboardVisible) {
+        if (keyboardVisible || keepModelWarmOnCpu) {
             recognizer = loaded
             activeProvider = provider
             publish(readyStatus())

@@ -10,7 +10,6 @@ import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.Point
 import android.graphics.Rect
-import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.AudioFormat
 import android.media.AudioRecord
@@ -20,14 +19,14 @@ import android.os.Handler
 import android.os.Looper
 import android.text.InputType
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.FrameLayout
-import android.widget.LinearLayout
-import android.widget.TextView
 import it.davide.parakeetdictation.DictationEngine.Completion
 
 /** Floating push-to-talk bubble tied to the visibility of the user's existing soft keyboard. */
@@ -36,8 +35,6 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
     private lateinit var windowManager: WindowManager
     private var bubble: View? = null
     private var micButton: FrameLayout? = null
-    private var titleText: TextView? = null
-    private var detailText: TextView? = null
     private var windowParams: WindowManager.LayoutParams? = null
     private var keyboardVisible = false
     private var keyboardTop = 0
@@ -47,6 +44,11 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
     @Volatile private var submitAfterRecording = false
     @Volatile private var audioRecord: AudioRecord? = null
     private var recorderThread: Thread? = null
+    private var dragStartX = 0f
+    private var dragStartY = 0f
+    private var dragWindowStartX = 0
+    private var dragWindowStartY = 0
+    private var bubbleDragging = false
 
     private val keyboardCheck = Runnable { updateKeyboardVisibility() }
 
@@ -58,6 +60,7 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
                 AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
         }
         DictationEngine.addObserver(this)
+        DictationEngine.initialize(this)
         scheduleKeyboardCheck(250)
     }
 
@@ -133,6 +136,7 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
     }
 
     private fun showBubble() {
+        val diameter = dp(BUBBLE_DIAMETER_DP)
         val mic = FrameLayout(this).apply {
             background = circle(LIME)
             isClickable = true
@@ -140,70 +144,35 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
             contentDescription = "Avvia dettatura Parakeet"
             addView(MicGlyph(this@DictationAccessibilityService), FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER))
             setOnClickListener { onMicTapped() }
+            setOnTouchListener(::handleBubbleTouch)
         }
         micButton = mic
 
-        val detail = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(10), 0, dp(13), 0)
-        }
-        titleText = TextView(this).apply {
-            text = "Preparo Parakeet…"
-            textSize = 13f
-            maxLines = 1
-            setTextColor(WHITE)
-            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-        }
-        detailText = TextView(this).apply {
-            text = "ITALIANO · LOCALE"
-            textSize = 9f
-            letterSpacing = 0.08f
-            maxLines = 1
-            setTextColor(MUTED)
-            setPadding(0, dp(3), 0, 0)
-        }
-        detail.addView(titleText)
-        detail.addView(detailText)
-
-        val pill = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(5), dp(5), dp(4), dp(5))
-            background = rounded(BACKGROUND, dp(32), STROKE)
-            elevation = dp(8).toFloat()
-            addView(mic, LinearLayout.LayoutParams(dp(50), dp(50)))
-            addView(detail, LinearLayout.LayoutParams(dp(132), -1))
-        }
-
-        val point = Point()
-        @Suppress("DEPRECATION")
-        windowManager.defaultDisplay.getRealSize(point)
-        val topLimit = maxOf(0, point.y - dp(70))
+        val point = screenSize()
+        val prefs = getSharedPreferences(BUBBLE_PREFERENCES, MODE_PRIVATE)
+        val maxX = maxOf(0, point.x - diameter)
+        val maxY = maxOf(0, point.y - diameter)
+        val hasSavedPosition = prefs.contains(BUBBLE_X_FRACTION) && prefs.contains(BUBBLE_Y_FRACTION)
         val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
+            diameter,
+            diameter,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT,
         ).apply {
-            gravity = Gravity.TOP or Gravity.END
-            x = dp(14)
-            y = (keyboardTop + dp(10)).coerceIn(dp(24), topLimit)
+            gravity = Gravity.TOP or Gravity.LEFT
+            x = if (hasSavedPosition) (prefs.getFloat(BUBBLE_X_FRACTION, 1f) * maxX).toInt() else maxX - dp(14)
+            y = if (hasSavedPosition) (prefs.getFloat(BUBBLE_Y_FRACTION, 0.5f) * maxY).toInt() else keyboardTop + dp(10)
             title = "Parakeet Dictation"
         }
+        clampBubblePosition(params, point.x, point.y, diameter)
         try {
-            windowManager.addView(pill, params)
-            bubble = pill
+            windowManager.addView(mic, params)
+            bubble = mic
             windowParams = params
-            renderStatus(
-                DictationEngine.Status(
-                    DictationEngine.currentPhase(),
-                    "",
-                )
-            )
+            renderStatus(DictationEngine.currentStatus())
         } catch (_: SecurityException) {
             bubble = null
             openSetup()
@@ -215,10 +184,8 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
     private fun updateBubblePosition() {
         val view = bubble ?: return
         val params = windowParams ?: return
-        val point = Point()
-        @Suppress("DEPRECATION")
-        windowManager.defaultDisplay.getRealSize(point)
-        params.y = (keyboardTop + dp(10)).coerceIn(dp(24), maxOf(dp(24), point.y - dp(70)))
+        val point = screenSize()
+        clampBubblePosition(params, point.x, point.y, view.width.takeIf { it > 0 } ?: dp(BUBBLE_DIAMETER_DP))
         runCatching { windowManager.updateViewLayout(view, params) }
     }
 
@@ -226,9 +193,74 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
         bubble?.let { view -> runCatching { windowManager.removeView(view) } }
         bubble = null
         micButton = null
-        titleText = null
-        detailText = null
         windowParams = null
+    }
+
+    private fun handleBubbleTouch(view: View, event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                val params = windowParams ?: return false
+                dragStartX = event.rawX
+                dragStartY = event.rawY
+                dragWindowStartX = params.x
+                dragWindowStartY = params.y
+                bubbleDragging = false
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val deltaX = event.rawX - dragStartX
+                val deltaY = event.rawY - dragStartY
+                if (!bubbleDragging && (kotlin.math.abs(deltaX) > ViewConfiguration.get(this).scaledTouchSlop ||
+                        kotlin.math.abs(deltaY) > ViewConfiguration.get(this).scaledTouchSlop)
+                ) bubbleDragging = true
+                if (bubbleDragging) moveBubbleTo(dragWindowStartX + deltaX.toInt(), dragWindowStartY + deltaY.toInt())
+                return true
+            }
+            MotionEvent.ACTION_UP -> {
+                if (bubbleDragging) saveBubblePosition() else view.performClick()
+                bubbleDragging = false
+                return true
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                bubbleDragging = false
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun moveBubbleTo(x: Int, y: Int) {
+        val view = bubble ?: return
+        val params = windowParams ?: return
+        val point = screenSize()
+        clampBubblePosition(params, point.x, point.y, view.width.takeIf { it > 0 } ?: dp(BUBBLE_DIAMETER_DP))
+        val size = view.width.takeIf { it > 0 } ?: dp(BUBBLE_DIAMETER_DP)
+        params.x = x.coerceIn(0, maxOf(0, point.x - size))
+        params.y = y.coerceIn(0, maxOf(0, point.y - size))
+        runCatching { windowManager.updateViewLayout(view, params) }
+    }
+
+    private fun saveBubblePosition() {
+        val view = bubble ?: return
+        val params = windowParams ?: return
+        val point = screenSize()
+        val size = view.width.takeIf { it > 0 } ?: dp(BUBBLE_DIAMETER_DP)
+        val maxX = maxOf(1, point.x - size)
+        val maxY = maxOf(1, point.y - size)
+        getSharedPreferences(BUBBLE_PREFERENCES, MODE_PRIVATE).edit()
+            .putFloat(BUBBLE_X_FRACTION, params.x.toFloat() / maxX)
+            .putFloat(BUBBLE_Y_FRACTION, params.y.toFloat() / maxY)
+            .apply()
+    }
+
+    private fun screenSize(): Point = Point().also { point ->
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.getRealSize(point)
+    }
+
+    private fun clampBubblePosition(params: WindowManager.LayoutParams, screenWidth: Int, screenHeight: Int, diameter: Int) {
+        params.x = params.x.coerceIn(0, maxOf(0, screenWidth - diameter))
+        params.y = params.y.coerceIn(0, maxOf(0, screenHeight - diameter))
     }
 
     private fun renderStatus(status: DictationEngine.Status) {
@@ -243,30 +275,20 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
             DictationEngine.Phase.ERROR -> "Tocca per riprovare"
             DictationEngine.Phase.IDLE -> "Preparo Parakeet…"
         }
-        titleText?.text = if (sensitiveEditor) "Campo protetto" else phaseTitle
-        detailText?.text = when {
-            sensitiveEditor -> "DETTATURA DISATTIVATA"
-            !editorAvailable -> "CAMPO NON DISPONIBILE"
-            status.phase == DictationEngine.Phase.RECORDING -> "TOCCA PER TERMINARE"
-            status.phase == DictationEngine.Phase.TRANSCRIBING -> "TESTO IN ARRIVO"
-            else -> "ITALIANO · LOCALE"
-        }
         micButton?.let { button ->
-            button.isEnabled = editorAvailable && !sensitiveEditor && (!isBusy || isRecording)
-            button.background = circle(when {
-                sensitiveEditor || !editorAvailable -> DISABLED
-                isRecording -> RED
-                isBusy -> DISABLED
-                else -> LIME
-            })
-            button.contentDescription = when {
+            button.isEnabled = true
+            button.alpha = 1f
+            button.background = circle(LIME)
+            val actionDescription = when {
                 sensitiveEditor -> "Dettatura disattivata nel campo protetto"
+                !editorAvailable -> "Dettatura Parakeet. Campo di testo non disponibile. $phaseTitle"
+                isBusy && !isRecording -> "Dettatura Parakeet. $phaseTitle"
                 isRecording -> "Interrompi e trascrivi"
-                else -> "Avvia dettatura"
+                else -> "Avvia dettatura. $phaseTitle"
             }
+            button.contentDescription = "Parakeet Dictation. ${status.message}. $actionDescription"
         }
-        // Keep the full diagnostic available to accessibility users without exposing field text.
-        bubble?.contentDescription = "Parakeet Dictation. ${status.message}"
+        // Keep status available to accessibility users without adding text around the green circle.
     }
 
     private fun refreshSensitiveState() {
@@ -447,13 +469,11 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
     }
 
     private fun renderError(message: String) {
-        titleText?.text = message.take(30)
-        detailText?.text = "TOCCA PER RIPROVARE"
+        bubble?.contentDescription = "Parakeet Dictation. $message. Tocca per riprovare."
     }
 
     private fun renderResult(message: String) {
-        titleText?.text = message
-        detailText?.text = "ITALIANO · LOCALE"
+        bubble?.contentDescription = "Parakeet Dictation. $message."
     }
 
     private fun openSetup() {
@@ -461,12 +481,6 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
-
-    private fun rounded(color: Int, radius: Int, stroke: Int = Color.TRANSPARENT) = GradientDrawable().apply {
-        setColor(color)
-        cornerRadius = radius.toFloat()
-        if (stroke != Color.TRANSPARENT) setStroke(dp(1), stroke)
-    }
 
     private fun circle(color: Int) = GradientDrawable().apply {
         setColor(color)
@@ -516,15 +530,13 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
     }
 
     companion object {
+        private const val BUBBLE_DIAMETER_DP = 54
+        private const val BUBBLE_PREFERENCES = "parakeet_bubble_position"
+        private const val BUBBLE_X_FRACTION = "x_fraction"
+        private const val BUBBLE_Y_FRACTION = "y_fraction"
         private const val MAX_RECORD_SECONDS = 120
         private const val MAX_SAMPLES = ModelFiles.SAMPLE_RATE * MAX_RECORD_SECONDS
         private const val MAX_EDITABLE_TEXT = 100_000
-        private const val BACKGROUND = 0xff141923.toInt()
-        private const val STROKE = 0xff3b4655.toInt()
-        private const val WHITE = Color.WHITE
-        private const val MUTED = 0xffa2aabb.toInt()
         private const val LIME = 0xffb8f36b.toInt()
-        private const val RED = 0xffff696e.toInt()
-        private const val DISABLED = 0xff737d8c.toInt()
     }
 }
