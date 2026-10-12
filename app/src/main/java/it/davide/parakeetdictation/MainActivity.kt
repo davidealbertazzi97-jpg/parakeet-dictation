@@ -27,10 +27,15 @@ class MainActivity : Activity() {
     private lateinit var permissionButton: Button
     private lateinit var serviceButton: Button
     private lateinit var serviceStatus: TextView
+    private lateinit var showBubbleSwitch: Switch
+    private lateinit var showBubbleDescription: TextView
     private lateinit var keepCpuSwitch: Switch
     private lateinit var keepCpuDescription: TextView
+    private lateinit var keepNnapiSwitch: Switch
+    private lateinit var keepNnapiDescription: TextView
     private var downloadActive = false
-    private var updatingCpuSwitch = false
+    private var updatingRuntimeSwitches = false
+    private var updatingBubbleSwitch = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -132,28 +137,64 @@ class MainActivity : Activity() {
         cpuOption.addView(cpuOptionText)
         keepCpuSwitch = Switch(this).apply {
             isChecked = DictationEngine.isKeepModelWarmOnCpu(this@MainActivity)
-            thumbTintList = android.content.res.ColorStateList(
-                arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
-                intArrayOf(LIME, Color.rgb(210, 214, 222)),
-            )
-            trackTintList = android.content.res.ColorStateList(
-                arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
-                intArrayOf(LIME.withAlpha(100), Color.rgb(77, 83, 96)),
-            )
+            thumbTintList = switchThumbTint()
+            trackTintList = switchTrackTint()
             setOnCheckedChangeListener { _, checked ->
-                if (updatingCpuSwitch) return@setOnCheckedChangeListener
+                if (updatingRuntimeSwitches) return@setOnCheckedChangeListener
                 if (checked && !ModelFiles.isInstalled(this@MainActivity)) {
-                    updatingCpuSwitch = true
+                    updatingRuntimeSwitches = true
                     isChecked = false
-                    updatingCpuSwitch = false
+                    updatingRuntimeSwitches = false
                     return@setOnCheckedChangeListener
                 }
+                updatingRuntimeSwitches = true
+                if (::keepNnapiSwitch.isInitialized) keepNnapiSwitch.isChecked = false
+                updatingRuntimeSwitches = false
                 updateCpuOptionDescription(checked)
+                updateNnapiOptionDescription(false)
                 DictationEngine.setKeepModelWarmOnCpu(this@MainActivity, checked)
             }
         }
         cpuOption.addView(keepCpuSwitch)
         modelCard.addView(cpuOption)
+
+        val nnapiOption = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(16), 0, 0)
+        }
+        val nnapiOptionText = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+        }
+        nnapiOptionText.addView(label("Mantieni pronto · acceleratore Android", 14f, WHITE, true))
+        keepNnapiDescription = label("NNAPI resta caricato; il driver del telefono decide se usare GPU, NPU o CPU.", 12f, MUTED).apply {
+            setPadding(0, dp(4), dp(8), 0)
+        }
+        nnapiOptionText.addView(keepNnapiDescription)
+        nnapiOption.addView(nnapiOptionText)
+        keepNnapiSwitch = Switch(this).apply {
+            isChecked = DictationEngine.isKeepModelWarmOnNnapi(this@MainActivity)
+            thumbTintList = switchThumbTint()
+            trackTintList = switchTrackTint()
+            setOnCheckedChangeListener { _, checked ->
+                if (updatingRuntimeSwitches) return@setOnCheckedChangeListener
+                if (checked && !ModelFiles.isInstalled(this@MainActivity)) {
+                    updatingRuntimeSwitches = true
+                    isChecked = false
+                    updatingRuntimeSwitches = false
+                    return@setOnCheckedChangeListener
+                }
+                updatingRuntimeSwitches = true
+                keepCpuSwitch.isChecked = false
+                updatingRuntimeSwitches = false
+                updateCpuOptionDescription(false)
+                updateNnapiOptionDescription(checked)
+                DictationEngine.setKeepModelWarmOnNnapi(this@MainActivity, checked)
+            }
+        }
+        nnapiOption.addView(keepNnapiSwitch)
+        modelCard.addView(nnapiOption)
         page.addView(modelCard)
 
         val setupCard = card().apply {
@@ -180,12 +221,44 @@ class MainActivity : Activity() {
         setupCard.addView(serviceButton)
         page.addView(setupCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) })
 
+        val bubbleCard = card()
+        bubbleCard.addView(label("BOLLA SOPRA LA TASTIERA", 11f, MUTED, true).apply { letterSpacing = 0.12f })
+        val bubbleOption = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(12), 0, 0)
+        }
+        val bubbleOptionText = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+        }
+        bubbleOptionText.addView(label("Mostra la bolla", 14f, WHITE, true))
+        showBubbleDescription = label("La bolla compare quando si apre la tastiera.", 12f, MUTED).apply {
+            setPadding(0, dp(4), dp(8), 0)
+        }
+        bubbleOptionText.addView(showBubbleDescription)
+        bubbleOption.addView(bubbleOptionText)
+        showBubbleSwitch = Switch(this).apply {
+            isChecked = !DictationAccessibilityService.isBubbleHidden(this@MainActivity)
+            thumbTintList = switchThumbTint()
+            trackTintList = switchTrackTint()
+            setOnCheckedChangeListener { _, checked ->
+                if (updatingBubbleSwitch) return@setOnCheckedChangeListener
+                updateBubbleOptionDescription(checked)
+                DictationAccessibilityService.setBubbleHidden(this@MainActivity, hidden = !checked)
+                refreshServiceStatus()
+            }
+        }
+        bubbleOption.addView(showBubbleSwitch)
+        bubbleCard.addView(bubbleOption)
+        page.addView(bubbleCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) })
+
         val howCard = card()
         howCard.addView(label("COME FUNZIONA", 11f, MUTED, true).apply { letterSpacing = 0.12f })
         howCard.addView(step("01", "Concedi microfono e attiva il servizio di accessibilità."))
         howCard.addView(step("02", "Apri un campo di testo: la bolla appare e il modello si carica subito."))
         howCard.addView(step("03", "Tieni premuta la bolla mentre parli e rilasciala per trascrivere. Un tocco breve avvia la registrazione; un altro la ferma e inserisce il testo."))
-        howCard.addView(step("04", "La bolla verde è trascinabile. Quando chiudi la tastiera sparisce; il modello viene scaricato dopo 1 minuto, a meno che tu attivi la modalità CPU sempre in RAM."))
+        howCard.addView(step("04", "La bolla verde è trascinabile e puoi nasconderla da questa schermata. Il modello viene scaricato un minuto dopo la chiusura della tastiera, salvo una delle modalità sempre pronte."))
         page.addView(howCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) })
 
         val noteCard = card().apply { setBackground(rounded(Color.rgb(28, 32, 42), dp(20))) }
@@ -193,7 +266,7 @@ class MainActivity : Activity() {
         noteCard.addView(label("L'audio non viene inviato al cloud. Il modello ONNX è circa 671 MB e il testo viene prodotto quando interrompi la dettatura.", 14f, MUTED).apply {
             setPadding(0, dp(8), 0, dp(12))
         })
-        noteCard.addView(label("Accelerazione Android NNAPI preferita; l'eventuale GPU o NPU dipende dal driver. Se non disponibile, viene usata la CPU.", 13f, MUTED))
+        noteCard.addView(label("NNAPI può usare gli acceleratori disponibili, ma il driver Android sceglie come distribuire il modello. Questa versione non può selezionare GPU e NPU separatamente; se NNAPI non è disponibile usa la CPU.", 13f, MUTED))
         page.addView(noteCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) })
 
         val demoCard = card()
@@ -277,11 +350,6 @@ class MainActivity : Activity() {
     private fun refreshState() {
         if (!::modelLabel.isInitialized) return
         val modelReady = ModelFiles.isInstalled(this)
-        updatingCpuSwitch = true
-        keepCpuSwitch.isChecked = DictationEngine.isKeepModelWarmOnCpu(this)
-        keepCpuSwitch.isEnabled = modelReady
-        updateCpuOptionDescription(keepCpuSwitch.isChecked)
-        updatingCpuSwitch = false
         if (!downloadActive && !ModelDownloader.isDownloading()) {
             modelLabel.text = if (modelReady) "Modello installato e verificato · 671 MB" else "Modello non ancora scaricato · 671 MB"
             downloadButton.text = if (modelReady) "Modello verificato" else "Scarica il modello · 671 MB"
@@ -293,13 +361,34 @@ class MainActivity : Activity() {
         permissionButton.text = if (permissionGranted) "Microfono autorizzato" else "Autorizza il microfono"
         permissionButton.isEnabled = !permissionGranted
 
+        updatingRuntimeSwitches = true
+        keepCpuSwitch.isChecked = DictationEngine.isKeepModelWarmOnCpu(this)
+        keepNnapiSwitch.isChecked = DictationEngine.isKeepModelWarmOnNnapi(this)
+        keepCpuSwitch.isEnabled = modelReady
+        keepNnapiSwitch.isEnabled = modelReady
+        updateCpuOptionDescription(keepCpuSwitch.isChecked)
+        updateNnapiOptionDescription(keepNnapiSwitch.isChecked)
+        updatingRuntimeSwitches = false
+
+        updatingBubbleSwitch = true
+        showBubbleSwitch.isChecked = !DictationAccessibilityService.isBubbleHidden(this)
+        updateBubbleOptionDescription(showBubbleSwitch.isChecked)
+        updatingBubbleSwitch = false
+
+        refreshServiceStatus()
+        serviceButton.text = if (isAccessibilityServiceEnabled()) "Impostazioni accessibilità" else "Attiva bolla fluttuante"
+        serviceButton.isEnabled = permissionGranted
+    }
+
+    private fun refreshServiceStatus() {
+        if (!::serviceStatus.isInitialized) return
         val enabled = isAccessibilityServiceEnabled()
+        val bubbleHidden = DictationAccessibilityService.isBubbleHidden(this)
         serviceStatus.text = when {
+            enabled && bubbleHidden -> "Servizio attivo · bolla nascosta"
             enabled -> "Bolla fluttuante attiva"
             else -> "Servizio di accessibilità non attivo"
         }
-        serviceButton.text = if (enabled) "Impostazioni accessibilità" else "Attiva bolla fluttuante"
-        serviceButton.isEnabled = permissionGranted
     }
 
     private fun isAccessibilityServiceEnabled(): Boolean {
@@ -356,11 +445,41 @@ class MainActivity : Activity() {
 
     private fun updateCpuOptionDescription(enabled: Boolean) {
         keepCpuDescription.text = if (enabled) {
-            "Attivo: il modello resta nella RAM sulla CPU anche quando la tastiera è chiusa. Aumenta l'uso di memoria e batteria."
+            "Attivo: resta pronto in RAM sulla CPU anche senza tastiera. Aumenta l'uso di memoria e batteria; Android può comunque chiudere il processo."
+        } else if (::keepNnapiSwitch.isInitialized && keepNnapiSwitch.isChecked) {
+            "CPU sempre pronta disattiva; è attiva la modalità acceleratore Android."
         } else {
-            "Disattivo: viene scaricato un minuto dopo la chiusura della tastiera."
+            "Disattivo: il modello viene rilasciato un minuto dopo la chiusura della tastiera."
         }
     }
+
+    private fun updateNnapiOptionDescription(enabled: Boolean) {
+        keepNnapiDescription.text = if (enabled) {
+            "Attivo: il recognizer NNAPI resta pronto in memoria. Il driver sceglie CPU, GPU o NPU; Android può comunque chiudere il processo."
+        } else if (::keepCpuSwitch.isInitialized && keepCpuSwitch.isChecked) {
+            "Acceleratore Android disattivo; il modello resta pronto sulla CPU."
+        } else {
+            "Disattivo: il modello viene rilasciato un minuto dopo la chiusura della tastiera."
+        }
+    }
+
+    private fun updateBubbleOptionDescription(visible: Boolean) {
+        showBubbleDescription.text = if (visible) {
+            "La bolla compare quando si apre la tastiera in qualsiasi app."
+        } else {
+            "Nascosta in tutte le app finché non riattivi questa opzione."
+        }
+    }
+
+    private fun switchThumbTint() = android.content.res.ColorStateList(
+        arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+        intArrayOf(LIME, Color.rgb(210, 214, 222)),
+    )
+
+    private fun switchTrackTint() = android.content.res.ColorStateList(
+        arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+        intArrayOf(LIME.withAlpha(100), Color.rgb(77, 83, 96)),
+    )
 
     private fun Int.withAlpha(alpha: Int): Int = (this and 0x00ffffff) or (alpha shl 24)
 

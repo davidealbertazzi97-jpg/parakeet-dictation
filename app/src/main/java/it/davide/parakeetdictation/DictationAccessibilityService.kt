@@ -3,6 +3,7 @@ package it.davide.parakeetdictation
 import android.Manifest
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.content.SharedPreferences
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -43,6 +44,8 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
     private var windowParams: WindowManager.LayoutParams? = null
     private var keyboardVisible = false
     private var keyboardTop = 0
+    private var bubbleHidden = false
+    private var engineKeyboardActive = false
     private var sensitiveEditor = false
     private var editorAvailable = false
     @Volatile private var recording = false
@@ -59,19 +62,31 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
     private var handleTapOnRelease = false
     private var suppressClickAction = false
     private var pressStartedAt = 0L
+    private var keyboardCheckAt = 0L
 
-    private val keyboardCheck = Runnable { updateKeyboardVisibility() }
+    private val keyboardCheck = Runnable {
+        keyboardCheckAt = 0L
+        updateKeyboardVisibility()
+    }
+    private val settingsListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == BUBBLE_HIDDEN_KEY) {
+            mainHandler.post { applyBubbleVisibilityPreference() }
+        }
+    }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        val preferences = getSharedPreferences(SETTINGS_PREFERENCES, MODE_PRIVATE)
+        bubbleHidden = preferences.getBoolean(BUBBLE_HIDDEN_KEY, false)
+        preferences.registerOnSharedPreferenceChangeListener(settingsListener)
         serviceInfo = serviceInfo.apply {
             flags = flags or AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
                 AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
         }
         DictationEngine.addObserver(this)
         DictationEngine.initialize(this)
-        scheduleKeyboardCheck(250)
+        scheduleKeyboardCheck(INITIAL_KEYBOARD_CHECK_MS)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -82,7 +97,10 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
         ) {
             sensitiveEditor = runCatching { event.source?.let(::isPasswordNode) ?: false }.getOrDefault(false)
         }
-        scheduleKeyboardCheck(120)
+        val delay = if (event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED ||
+            event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+        ) WINDOW_CHANGE_CHECK_MS else ACCESSIBILITY_EVENT_CHECK_MS
+        scheduleKeyboardCheck(delay)
     }
 
     override fun onInterrupt() {
@@ -91,10 +109,14 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
 
     override fun onDestroy() {
         mainHandler.removeCallbacks(keyboardCheck)
+        keyboardCheckAt = 0L
         stopRecording(submit = false)
         hideBubble()
+        getSharedPreferences(SETTINGS_PREFERENCES, MODE_PRIVATE)
+            .unregisterOnSharedPreferenceChangeListener(settingsListener)
         DictationEngine.removeObserver(this)
         DictationEngine.onKeyboardHidden()
+        engineKeyboardActive = false
         super.onDestroy()
     }
 
@@ -104,17 +126,22 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
     }
 
     private fun scheduleKeyboardCheck(delayMs: Long) {
+        val dueAt = SystemClock.uptimeMillis() + delayMs
+        if (keyboardCheckAt != 0L && keyboardCheckAt <= dueAt) return
         mainHandler.removeCallbacks(keyboardCheck)
-        mainHandler.postDelayed(keyboardCheck, delayMs)
+        keyboardCheckAt = dueAt
+        mainHandler.postAtTime(keyboardCheck, dueAt)
     }
 
     private fun updateKeyboardVisibility() {
-        val inputMethodWindow = runCatching {
-            windows.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD }
+        val bounds = runCatching {
+            windows.asSequence()
+                .filter { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD }
+                .map { Rect().also(it::getBoundsInScreen) }
+                .maxByOrNull { it.width().toLong() * it.height().toLong() }
         }.getOrNull()
-        val bounds = Rect()
-        inputMethodWindow?.getBoundsInScreen(bounds)
-        val visible = inputMethodWindow != null && bounds.height() >= dp(100) && bounds.width() >= dp(160)
+        val visible = bounds != null && bounds.height() >= dp(MIN_KEYBOARD_HEIGHT_DP) &&
+            bounds.width() >= dp(MIN_KEYBOARD_WIDTH_DP)
         if (visible) {
             val editor = runCatching { focusedEditableNode() }.getOrNull()
             editorAvailable = editor?.isEditable == true
@@ -123,16 +150,16 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
         } else if (keyboardVisible) {
             setKeyboardVisible(false, keyboardTop)
         }
+        scheduleKeyboardCheck(if (keyboardVisible) VISIBLE_KEYBOARD_POLL_MS else HIDDEN_KEYBOARD_POLL_MS)
     }
 
     private fun setKeyboardVisible(visible: Boolean, top: Int) {
         val changed = keyboardVisible != visible
         keyboardVisible = visible
         keyboardTop = top
-        if (visible) {
+        if (visible && !bubbleHidden) {
             if (bubble == null) showBubble()
             else updateBubblePosition()
-            if (changed) DictationEngine.onKeyboardShown(this)
             refreshSensitiveState()
             if (changed) {
                 mainHandler.postDelayed({ if (keyboardVisible) refreshSensitiveState() }, 250)
@@ -141,8 +168,30 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
         } else {
             hideBubble()
             if (recording) stopRecording(submit = false)
-            if (changed) DictationEngine.onKeyboardHidden()
         }
+        updateEngineKeyboardState()
+    }
+
+    private fun applyBubbleVisibilityPreference() {
+        val hidden = isBubbleHidden(this)
+        if (bubbleHidden == hidden) return
+        bubbleHidden = hidden
+        if (keyboardVisible && !bubbleHidden) {
+            if (bubble == null) showBubble() else updateBubblePosition()
+            refreshSensitiveState()
+        } else {
+            if (recording) stopRecording(submit = false)
+            hideBubble()
+        }
+        updateEngineKeyboardState()
+    }
+
+    private fun updateEngineKeyboardState() {
+        val shouldLoadForKeyboard = keyboardVisible && !bubbleHidden
+        if (engineKeyboardActive == shouldLoadForKeyboard) return
+        engineKeyboardActive = shouldLoadForKeyboard
+        if (shouldLoadForKeyboard) DictationEngine.onKeyboardShown(this)
+        else DictationEngine.onKeyboardHidden()
     }
 
     private fun showBubble() {
@@ -867,8 +916,17 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
         private const val CANCEL_X_OFFSET_DP = 54
         private const val CANCEL_Y_OFFSET_DP = -5
         private const val BUBBLE_PREFERENCES = "parakeet_bubble_position"
+        private const val SETTINGS_PREFERENCES = "parakeet_dictation_settings"
+        private const val BUBBLE_HIDDEN_KEY = "bubble_hidden"
         private const val BUBBLE_X_FRACTION = "x_fraction"
         private const val BUBBLE_Y_FRACTION = "y_fraction"
+        private const val INITIAL_KEYBOARD_CHECK_MS = 100L
+        private const val WINDOW_CHANGE_CHECK_MS = 50L
+        private const val ACCESSIBILITY_EVENT_CHECK_MS = 90L
+        private const val VISIBLE_KEYBOARD_POLL_MS = 250L
+        private const val HIDDEN_KEYBOARD_POLL_MS = 500L
+        private const val MIN_KEYBOARD_HEIGHT_DP = 90
+        private const val MIN_KEYBOARD_WIDTH_DP = 120
         private const val TAP_TO_TOGGLE_MS = 200L
         private const val WAVE_CYCLE_MS = 1_300L
         private const val WAVE_COUNT = 4
@@ -888,6 +946,16 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
         private const val MAX_EDITABLE_TEXT = 100_000
         private const val LIME = 0xffb8f36b.toInt()
         private const val CANCEL_RED = 0xffe5484d.toInt()
+
+        fun isBubbleHidden(context: android.content.Context): Boolean = context
+            .getSharedPreferences(SETTINGS_PREFERENCES, android.content.Context.MODE_PRIVATE)
+            .getBoolean(BUBBLE_HIDDEN_KEY, false)
+
+        fun setBubbleHidden(context: android.content.Context, hidden: Boolean) {
+            context.getSharedPreferences(SETTINGS_PREFERENCES, android.content.Context.MODE_PRIVATE).edit()
+                .putBoolean(BUBBLE_HIDDEN_KEY, hidden)
+                .apply()
+        }
     }
 
     private enum class PressStartResult { STARTED, NEEDS_SETUP, REJECTED }
