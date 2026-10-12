@@ -184,7 +184,7 @@ class MainActivity : Activity() {
         howCard.addView(label("COME FUNZIONA", 11f, MUTED, true).apply { letterSpacing = 0.12f })
         howCard.addView(step("01", "Concedi microfono e attiva il servizio di accessibilità."))
         howCard.addView(step("02", "Apri un campo di testo: la bolla appare e il modello si carica subito."))
-        howCard.addView(step("03", "Tocca la bolla, parla e toccala di nuovo: il testo entra nel campo attivo."))
+        howCard.addView(step("03", "Tieni premuta la bolla mentre parli e rilasciala per trascrivere. Un tocco breve avvia la registrazione; un altro la ferma e inserisce il testo."))
         howCard.addView(step("04", "La bolla verde è trascinabile. Quando chiudi la tastiera sparisce; il modello viene scaricato dopo 1 minuto, a meno che tu attivi la modalità CPU sempre in RAM."))
         page.addView(howCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) })
 

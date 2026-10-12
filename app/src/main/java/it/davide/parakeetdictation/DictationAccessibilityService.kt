@@ -17,6 +17,7 @@ import android.media.MediaRecorder
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.text.InputType
 import android.view.Gravity
 import android.view.MotionEvent
@@ -35,6 +36,7 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
     private lateinit var windowManager: WindowManager
     private var bubble: View? = null
     private var micButton: FrameLayout? = null
+    private var waveEffect: RecordingWavesView? = null
     private var windowParams: WindowManager.LayoutParams? = null
     private var keyboardVisible = false
     private var keyboardTop = 0
@@ -49,6 +51,11 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
     private var dragWindowStartX = 0
     private var dragWindowStartY = 0
     private var bubbleDragging = false
+    private var recordingStartedByPress = false
+    private var recordingBeforePress = false
+    private var handleTapOnRelease = false
+    private var suppressClickAction = false
+    private var pressStartedAt = 0L
 
     private val keyboardCheck = Runnable { updateKeyboardVisibility() }
 
@@ -136,26 +143,34 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
     }
 
     private fun showBubble() {
-        val diameter = dp(BUBBLE_DIAMETER_DP)
         val mic = FrameLayout(this).apply {
             background = circle(LIME)
-            isClickable = true
+            isClickable = false
             isFocusable = false
-            contentDescription = "Avvia dettatura Parakeet"
             addView(MicGlyph(this@DictationAccessibilityService), FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER))
-            setOnClickListener { onMicTapped() }
-            setOnTouchListener(::handleBubbleTouch)
         }
         micButton = mic
+        val waves = RecordingWavesView(this)
+        val overlay = FrameLayout(this).apply {
+            isClickable = true
+            isFocusable = false
+            setBackgroundColor(Color.TRANSPARENT)
+            addView(waves, FrameLayout.LayoutParams(-1, -1))
+            addView(mic, FrameLayout.LayoutParams(dp(BUBBLE_DIAMETER_DP), dp(BUBBLE_DIAMETER_DP), Gravity.CENTER))
+            setOnClickListener { if (!suppressClickAction) onMicTapped() }
+            setOnTouchListener(::handleBubbleTouch)
+        }
+        waveEffect = waves
 
         val point = screenSize()
         val prefs = getSharedPreferences(BUBBLE_PREFERENCES, MODE_PRIVATE)
-        val maxX = maxOf(0, point.x - diameter)
-        val maxY = maxOf(0, point.y - diameter)
+        val overlaySize = dp(OVERLAY_SIZE_DP)
+        val maxX = maxOf(0, point.x - overlaySize)
+        val maxY = maxOf(0, point.y - overlaySize)
         val hasSavedPosition = prefs.contains(BUBBLE_X_FRACTION) && prefs.contains(BUBBLE_Y_FRACTION)
         val params = WindowManager.LayoutParams(
-            diameter,
-            diameter,
+            overlaySize,
+            overlaySize,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
@@ -163,21 +178,24 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
             PixelFormat.TRANSLUCENT,
         ).apply {
             gravity = Gravity.TOP or Gravity.LEFT
-            x = if (hasSavedPosition) (prefs.getFloat(BUBBLE_X_FRACTION, 1f) * maxX).toInt() else maxX - dp(14)
-            y = if (hasSavedPosition) (prefs.getFloat(BUBBLE_Y_FRACTION, 0.5f) * maxY).toInt() else keyboardTop + dp(10)
+            x = if (hasSavedPosition) (prefs.getFloat(BUBBLE_X_FRACTION, 1f) * maxX).toInt() else maxX
+            y = if (hasSavedPosition) (prefs.getFloat(BUBBLE_Y_FRACTION, 0.5f) * maxY).toInt()
+            else keyboardTop - dp((OVERLAY_SIZE_DP - BUBBLE_DIAMETER_DP) / 2) + dp(10)
             title = "Parakeet Dictation"
         }
-        clampBubblePosition(params, point.x, point.y, diameter)
+        clampBubblePosition(params, point.x, point.y, overlaySize)
         try {
-            windowManager.addView(mic, params)
-            bubble = mic
+            windowManager.addView(overlay, params)
+            bubble = overlay
             windowParams = params
             renderStatus(DictationEngine.currentStatus())
         } catch (_: SecurityException) {
             bubble = null
+            waveEffect = null
             openSetup()
         } catch (_: WindowManager.BadTokenException) {
             bubble = null
+            waveEffect = null
         }
     }
 
@@ -190,9 +208,11 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
     }
 
     private fun hideBubble() {
+        waveEffect?.setRecording(false)
         bubble?.let { view -> runCatching { windowManager.removeView(view) } }
         bubble = null
         micButton = null
+        waveEffect = null
         windowParams = null
     }
 
@@ -204,25 +224,60 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
                 dragStartY = event.rawY
                 dragWindowStartX = params.x
                 dragWindowStartY = params.y
+                pressStartedAt = event.eventTime
                 bubbleDragging = false
+                recordingBeforePress = recording
+                recordingStartedByPress = false
+                handleTapOnRelease = false
+                if (!recordingBeforePress) {
+                    when (startRecordingOnPress()) {
+                        PressStartResult.STARTED -> recordingStartedByPress = true
+                        PressStartResult.NEEDS_SETUP -> handleTapOnRelease = true
+                        PressStartResult.REJECTED -> Unit
+                    }
+                }
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
                 val deltaX = event.rawX - dragStartX
                 val deltaY = event.rawY - dragStartY
-                if (!bubbleDragging && (kotlin.math.abs(deltaX) > ViewConfiguration.get(this).scaledTouchSlop ||
-                        kotlin.math.abs(deltaY) > ViewConfiguration.get(this).scaledTouchSlop)
+                val dragThreshold = maxOf(ViewConfiguration.get(this).scaledTouchSlop, dp(24))
+                if (!bubbleDragging && (kotlin.math.abs(deltaX) > dragThreshold ||
+                        kotlin.math.abs(deltaY) > dragThreshold)
                 ) bubbleDragging = true
-                if (bubbleDragging) moveBubbleTo(dragWindowStartX + deltaX.toInt(), dragWindowStartY + deltaY.toInt())
+                if (bubbleDragging) {
+                    if (recording) stopRecording(submit = false)
+                    moveBubbleTo(dragWindowStartX + deltaX.toInt(), dragWindowStartY + deltaY.toInt())
+                }
                 return true
             }
             MotionEvent.ACTION_UP -> {
-                if (bubbleDragging) saveBubblePosition() else view.performClick()
+                if (bubbleDragging) {
+                    saveBubblePosition()
+                } else {
+                    when {
+                        recordingStartedByPress && recording -> {
+                            // A short tap starts toggle recording; holding the button records only until release.
+                            if (event.eventTime - pressStartedAt >= TAP_TO_TOGGLE_MS) stopRecording(submit = true)
+                        }
+                        recordingBeforePress && recording -> stopRecording(submit = true)
+                        handleTapOnRelease -> onMicTapped()
+                    }
+                    suppressClickAction = true
+                    try { view.performClick() } finally { suppressClickAction = false }
+                }
                 bubbleDragging = false
+                recordingStartedByPress = false
+                recordingBeforePress = false
+                handleTapOnRelease = false
                 return true
             }
             MotionEvent.ACTION_CANCEL -> {
+                if (recordingStartedByPress && recording) stopRecording(submit = false)
                 bubbleDragging = false
+                recordingStartedByPress = false
+                recordingBeforePress = false
+                handleTapOnRelease = false
                 return true
             }
         }
@@ -276,19 +331,18 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
             DictationEngine.Phase.IDLE -> "Preparo Parakeet…"
         }
         micButton?.let { button ->
-            button.isEnabled = true
-            button.alpha = 1f
             button.background = circle(LIME)
-            val actionDescription = when {
-                sensitiveEditor -> "Dettatura disattivata nel campo protetto"
-                !editorAvailable -> "Dettatura Parakeet. Campo di testo non disponibile. $phaseTitle"
-                isBusy && !isRecording -> "Dettatura Parakeet. $phaseTitle"
-                isRecording -> "Interrompi e trascrivi"
-                else -> "Avvia dettatura. $phaseTitle"
-            }
-            button.contentDescription = "Parakeet Dictation. ${status.message}. $actionDescription"
+        }
+        waveEffect?.setRecording(isRecording)
+        val actionDescription = when {
+            sensitiveEditor -> "Dettatura disattivata nel campo protetto"
+            !editorAvailable -> "Campo di testo non disponibile. $phaseTitle"
+            isBusy && !isRecording -> phaseTitle
+            isRecording -> "Rilascia per trascrivere"
+            else -> "Tieni premuto per dettare, oppure tocca per avviare"
         }
         // Keep status available to accessibility users without adding text around the green circle.
+        bubble?.contentDescription = "Parakeet Dictation. ${status.message}. $actionDescription"
     }
 
     private fun refreshSensitiveState() {
@@ -323,6 +377,31 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
             DictationEngine.Phase.MISSING_MODEL, DictationEngine.Phase.ERROR, DictationEngine.Phase.IDLE -> openSetup()
             DictationEngine.Phase.READY -> startRecording()
             else -> Unit
+        }
+    }
+
+    private fun startRecordingOnPress(): PressStartResult {
+        if (!keyboardVisible) return PressStartResult.REJECTED
+        if (sensitiveEditor || focusedEditableNode()?.let(::isPasswordNode) == true) {
+            sensitiveEditor = true
+            renderStatus(DictationEngine.Status(DictationEngine.Phase.ERROR, "Campo protetto"))
+            return PressStartResult.REJECTED
+        }
+        if (focusedEditableNode()?.isEditable != true) {
+            renderError("Campo di testo non accessibile")
+            return PressStartResult.REJECTED
+        }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            return PressStartResult.NEEDS_SETUP
+        }
+        return when (DictationEngine.currentPhase()) {
+            DictationEngine.Phase.READY -> {
+                startRecording()
+                if (recording) PressStartResult.STARTED else PressStartResult.REJECTED
+            }
+            DictationEngine.Phase.MISSING_MODEL, DictationEngine.Phase.ERROR, DictationEngine.Phase.IDLE ->
+                PressStartResult.NEEDS_SETUP
+            else -> PressStartResult.REJECTED
         }
     }
 
@@ -420,7 +499,13 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
         val node = runCatching { focusedEditableNode() }.getOrNull() ?: return false
         if (!node.isEditable || isPasswordNode(node)) return false
 
-        val existing = node.text?.toString().orEmpty()
+        val nodeText = node.text?.toString().orEmpty()
+        val hintText = node.hintText?.toString().orEmpty()
+        val showingHint = runCatching { node.isShowingHintText }.getOrDefault(false)
+        val isHint = hintText.isNotBlank() && normalizeHint(nodeText) == normalizeHint(hintText)
+        val isEmptyMessagePlaceholder = normalizeHint(nodeText).equals("messaggio", ignoreCase = true) &&
+            node.textSelectionStart <= 0 && node.textSelectionEnd <= 0
+        val existing = if (showingHint || isHint || isEmptyMessagePlaceholder) "" else nodeText
         if (existing.length > MAX_EDITABLE_TEXT) return false
         val selectionStart = node.textSelectionStart.takeIf { it >= 0 }?.coerceIn(0, existing.length) ?: existing.length
         val selectionEnd = node.textSelectionEnd.takeIf { it >= 0 }?.coerceIn(0, existing.length) ?: selectionStart
@@ -467,6 +552,8 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
             InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD,
         )) || (inputClass == InputType.TYPE_CLASS_NUMBER && variation == InputType.TYPE_NUMBER_VARIATION_PASSWORD)
     }
+
+    private fun normalizeHint(value: String): String = value.trim().trimEnd('…', '.', ':').trim()
 
     private fun renderError(message: String) {
         bubble?.contentDescription = "Parakeet Dictation. $message. Tocca per riprovare."
@@ -529,14 +616,58 @@ class DictationAccessibilityService : AccessibilityService(), DictationEngine.Ob
         }
     }
 
+    private class RecordingWavesView(context: android.content.Context) : View(context) {
+        private val density = resources.displayMetrics.density
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = LIME
+            style = Paint.Style.STROKE
+            strokeWidth = 2f * density
+        }
+        private var recording = false
+
+        fun setRecording(active: Boolean) {
+            if (recording == active) return
+            recording = active
+            invalidate()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            if (!recording) return
+
+            val cycle = (SystemClock.uptimeMillis() % WAVE_CYCLE_MS).toFloat() / WAVE_CYCLE_MS
+            val centerX = width / 2f
+            val centerY = height / 2f
+            val innerRadius = dp(WAVE_INNER_RADIUS_DP).toFloat()
+            val outerRadius = minOf(width, height) / 2f - dp(WAVE_EDGE_MARGIN_DP)
+            for (index in 0 until WAVE_COUNT) {
+                val phase = (cycle + index.toFloat() / WAVE_COUNT) % 1f
+                val radius = innerRadius + (outerRadius - innerRadius) * phase
+                paint.alpha = ((1f - phase) * 210).toInt()
+                canvas.drawCircle(centerX, centerY, radius, paint)
+            }
+            postInvalidateOnAnimation()
+        }
+
+        private fun dp(value: Int): Int = (value * density).toInt()
+    }
+
     companion object {
         private const val BUBBLE_DIAMETER_DP = 54
+        private const val OVERLAY_SIZE_DP = 84
         private const val BUBBLE_PREFERENCES = "parakeet_bubble_position"
         private const val BUBBLE_X_FRACTION = "x_fraction"
         private const val BUBBLE_Y_FRACTION = "y_fraction"
+        private const val TAP_TO_TOGGLE_MS = 200L
+        private const val WAVE_CYCLE_MS = 1_200L
+        private const val WAVE_COUNT = 3
+        private const val WAVE_INNER_RADIUS_DP = 29
+        private const val WAVE_EDGE_MARGIN_DP = 3
         private const val MAX_RECORD_SECONDS = 120
         private const val MAX_SAMPLES = ModelFiles.SAMPLE_RATE * MAX_RECORD_SECONDS
         private const val MAX_EDITABLE_TEXT = 100_000
         private const val LIME = 0xffb8f36b.toInt()
     }
+
+    private enum class PressStartResult { STARTED, NEEDS_SETUP, REJECTED }
 }

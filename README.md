@@ -9,7 +9,7 @@ App Android per dettatura locale con bolla fluttuante, usando la tastiera Androi
 3. Concedi il permesso microfono.
 4. Apri le impostazioni di accessibilità dall'app, leggi la descrizione di Parakeet Dictation e attiva il servizio.
 5. Apri un campo di testo in un'altra app: compare un cerchio verde trascinabile sopra la tastiera e il recognizer inizia subito a caricarsi.
-6. Tocca la bolla per registrare; toccala di nuovo per fermare, trascrivere e inserire il testo.
+6. Tieni premuta la bolla mentre parli e rilasciala per trascrivere e inserire il testo. Un tocco breve avvia la registrazione; un secondo tocco la ferma.
 
 Per creare una release firmata, configura la chiave localmente tramite il file ignorato `keystore.properties` nella root del progetto oppure con le variabili d'ambiente `PARAKEET_SIGNING_STORE_FILE`, `PARAKEET_SIGNING_STORE_PASSWORD`, `PARAKEET_SIGNING_KEY_ALIAS` e `PARAKEET_SIGNING_KEY_PASSWORD`, quindi esegui `./gradlew :app:assembleRelease`. La build si interrompe se la firma di release non è configurata. L'APK viene generato in `app/build/outputs/apk/release/app-release.apk`.
 
@@ -17,7 +17,7 @@ Per creare una release firmata, configura la chiave localmente tramite il file i
 
 - La bolla è un cerchio verde `TYPE_ACCESSIBILITY_OVERLAY`, senza pannello o bordo scuro. Puoi trascinarla in qualsiasi punto dello schermo; la posizione viene ricordata. Compare quando il servizio vede la finestra della tastiera Android e scompare quando la tastiera viene chiusa.
 - La chiusura della tastiera avvia un timer di 60 secondi. Se si riapre entro quel tempo, il modello resta in memoria; al termine il recognizer viene rilasciato. I file del modello restano nella memoria privata dell'app.
-- La dettatura non parte automaticamente: il microfono si attiva solo dopo il tocco sulla bolla. I campi password vengono esclusi. L'audio è mantenuto in RAM per la trascrizione locale e non viene inviato in rete.
+- La dettatura non parte automaticamente: il microfono si attiva solo toccando la bolla. Puoi tenerla premuta e rilasciarla per trascrivere, oppure usare due tocchi brevi per avviare e fermare la registrazione. Piccole onde animate intorno alla bolla indicano quando sta registrando. I segnaposto del campo (per esempio “Messaggio”) non vengono inclusi nel testo inserito. I campi password vengono esclusi. L'audio è mantenuto in RAM per la trascrizione locale e non viene inviato in rete.
 - Per inserire il risultato, il servizio usa l'albero di accessibilità del campo attivo e le azioni `ACTION_SET_TEXT` / `ACTION_SET_SELECTION`. Alcuni campi personalizzati, app bancarie, browser o finestre di sistema possono non esporre un campo modificabile accessibile; in quel caso il testo non può essere inserito. È necessaria una prova sul dispositivo e sulle app usate quotidianamente.
 - Parakeet TDT v3 è offline e non è streaming: la frase viene prodotta dopo Stop. La registrazione si interrompe dopo un massimo di due minuti.
 - Il runtime preferisce l'Execution Provider Android NNAPI. Il driver può assegnare calcoli a CPU, GPU o NPU; questa app non può forzare o confermare che il driver scelga la GPU. Se NNAPI non parte o il decode accelerato fallisce, prova la CPU.
