@@ -1,0 +1,82 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+def signingProperties = new Properties()
+def signingPropertiesFile = rootProject.file('keystore.properties')
+if (signingPropertiesFile.exists()) {
+    signingPropertiesFile.withInputStream { signingProperties.load(it) }
+}
+
+def signingValue = { String propertyName, String environmentName ->
+    signingProperties.getProperty(propertyName) ?: System.getenv(environmentName)
+}
+
+def releaseStoreFile = signingValue('storeFile', 'PARAKEET_SIGNING_STORE_FILE')
+def releaseStorePassword = signingValue('storePassword', 'PARAKEET_SIGNING_STORE_PASSWORD')
+def releaseKeyAlias = signingValue('keyAlias', 'PARAKEET_SIGNING_KEY_ALIAS')
+def releaseKeyPassword = signingValue('keyPassword', 'PARAKEET_SIGNING_KEY_PASSWORD')
+def hasReleaseSigning = [releaseStoreFile, releaseStorePassword, releaseKeyAlias, releaseKeyPassword]
+        .every { it != null && !it.toString().isBlank() }
+
+android {
+    namespace 'it.davide.parakeetdictation'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'it.davide.parakeetdictation'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '0.1.0'
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (hasReleaseSigning) {
+                signingConfig signingConfigs.create('release') {
+                    storeFile rootProject.file(releaseStoreFile)
+                    storePassword releaseStorePassword
+                    keyAlias releaseKeyAlias
+                    keyPassword releaseKeyPassword
+                }
+            }
+        }
+    }
+}
+
+dependencies {
+    implementation project(':sherpa_onnx')
+}
+
+tasks.configureEach { task ->
+    if (task.name == 'packageRelease') {
+        task.doFirst {
+            if (!hasReleaseSigning) {
+                throw new GradleException(
+                        'Release signing is not configured. Add an ignored keystore.properties file or set PARAKEET_SIGNING_* environment variables.'
+                )
+            }
+        }
+    }
+}

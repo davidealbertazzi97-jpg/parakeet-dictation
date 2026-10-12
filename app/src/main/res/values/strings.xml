@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Parakeet Dictation</string>
+    <string name="accessibility_service_name">Parakeet Dictation</string>
+    <string name="accessibility_service_description">Mostra la bolla quando appare la tastiera e inserisce nel campo attivo solo il testo dettato dopo che hai toccato il microfono.</string>
+</resources>
