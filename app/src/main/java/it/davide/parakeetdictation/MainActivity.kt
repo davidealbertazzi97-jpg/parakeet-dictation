@@ -96,6 +96,10 @@ class MainActivity : Activity() {
         page.addView(label("Una bolla vocale sopra la tastiera che usi già, pronta appena compare.", 16f, MUTED).apply {
             setPadding(0, 0, 0, dp(22))
         })
+        page.addView(actionButton("Licenza e garanzia", primary = false).apply {
+            layoutParams = LinearLayout.LayoutParams(-1, dp(46)).apply { bottomMargin = dp(16) }
+            setOnClickListener { showLicenseNotice() }
+        })
 
         val modelCard = card()
         modelCard.addView(label("MODELLO", 11f, MUTED, true).apply { letterSpacing = 0.12f })
@@ -344,6 +348,71 @@ class MainActivity : Activity() {
             .setPositiveButton("Apri impostazioni") { _, _ ->
                 startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
             }
+            .show()
+    }
+
+    private fun showLicenseNotice() {
+        val notice = label(
+            "Copyright © 2026 Parakeet Dictation contributors.\n\n" +
+                "Questo programma è software libero: puoi ridistribuirlo e modificarlo secondo i termini della GNU Affero General Public License, versione 3 o successiva.\n\n" +
+                "È distribuito senza alcuna garanzia, anche senza garanzie implicite di commerciabilità o idoneità a uno scopo particolare.\n\n" +
+                "Il testo completo della licenza AGPL e gli avvisi delle licenze di terze parti sono inclusi nell'app.",
+            14f,
+            WHITE,
+        ).apply { setPadding(dp(4), dp(4), dp(4), dp(4)) }
+        val scroll = ScrollView(this).apply {
+            setPadding(dp(20), dp(8), dp(20), dp(8))
+            addView(notice)
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Licenza e garanzia")
+            .setView(scroll)
+            .setNeutralButton("Licenze componenti") { _, _ -> showThirdPartyLicensePicker() }
+            .setNegativeButton("Chiudi", null)
+            .setPositiveButton("Testo completo AGPL") { _, _ ->
+                showLicenseAsset("GNU AGPL v3", "licenses/AGPL-3.0.txt")
+            }
+            .show()
+    }
+
+    private fun showThirdPartyLicensePicker() {
+        val documents = arrayOf(
+            "Riepilogo avvisi",
+            "sherpa-onnx · Apache 2.0",
+            "ONNX Runtime · MIT",
+            "ONNX Runtime · avvisi dipendenze",
+            "Modello Parakeet · CC BY 4.0",
+        )
+        val assets = arrayOf(
+            "licenses/THIRD_PARTY_NOTICES.md",
+            "licenses/Apache-2.0.txt",
+            "licenses/ONNXRUNTIME-MIT-LICENSE.txt",
+            "licenses/ONNXRUNTIME-THIRD-PARTY-NOTICES.txt",
+            "licenses/Parakeet-Model-CC-BY-4.0.md",
+        )
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Licenze dei componenti")
+            .setItems(documents) { _, which -> showLicenseAsset(documents[which], assets[which]) }
+            .setNegativeButton("Chiudi", null)
+            .show()
+    }
+
+    private fun showLicenseAsset(title: String, assetPath: String) {
+        val licenseText = runCatching {
+            assets.open(assetPath).bufferedReader().use { it.readText() }
+        }.getOrElse { "Il testo della licenza non è disponibile." }
+        val text = TextView(this).apply {
+            this.text = licenseText
+            textSize = 12f
+            setTextColor(WHITE)
+            setPadding(dp(20), dp(12), dp(20), dp(12))
+            setTextIsSelectable(true)
+        }
+        val scroll = ScrollView(this).apply { addView(text) }
+        android.app.AlertDialog.Builder(this)
+            .setTitle(title)
+            .setView(scroll)
+            .setPositiveButton("Chiudi", null)
             .show()
     }
 

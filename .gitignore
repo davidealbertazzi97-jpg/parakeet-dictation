@@ -7,5 +7,12 @@ keystore.properties
 signing.properties
 *.jks
 *.keystore
+*.p12
+*.pfx
+*.pem
+*.key
 *.apk
 *.aab
+.env
+.env.*
+!.env.example
